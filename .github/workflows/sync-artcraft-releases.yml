@@ -1,0 +1,278 @@
+name: Sync newest ArtCraft releases
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Validate all seven mirrors without changing releases'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: artcraft-release-sync
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: github.repository == 'allsagetech/artcraft-release-sync'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        app: [wordcraft, gridcraft, deckcraft, cadcraft, pdfcraft, photocraft, filmcraft]
+    steps:
+      - name: Copy and verify the newest stable upstream release
+        env:
+          APP: ${{ matrix.app }}
+          GH_READ_TOKEN: ${{ github.token }}
+          ARTCRAFT_MIRROR_TOKEN: ${{ secrets.ARTCRAFT_MIRROR_TOKEN }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+        shell: python
+        run: |
+          """Copy only the latest stable ArtCraft release; never execute upstream code."""
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          import tempfile
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          
+          APPS = ('wordcraft', 'gridcraft', 'deckcraft', 'cadcraft', 'pdfcraft', 'photocraft', 'filmcraft')
+          OWNER = 'allsagetech'
+          UPSTREAM = 'storytold'
+          
+          
+          class GitHub:
+              def __init__(self, token, read_only=False):
+                  self.token = token
+                  self.read_only = read_only
+          
+              def request(self, method, path, payload=None, missing_ok=False, upload=False, content_type=None):
+                  if self.read_only and method != 'GET':
+                      raise RuntimeError('Validation mode cannot change GitHub')
+                  host = 'uploads.github.com' if upload else 'api.github.com'
+                  url = 'https://' + host + '/' + path.lstrip('/')
+                  headers = {'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2026-03-10', 'User-Agent': 'allsagetech-artcraft-release-sync'}
+                  if self.token:
+                      headers['Authorization'] = 'Bearer ' + self.token
+                  body = payload if upload else json.dumps(payload).encode() if payload is not None else None
+                  if body is not None:
+                      headers['Content-Type'] = content_type or 'application/json'
+                  for attempt in range(4):
+                      try:
+                          req = urllib.request.Request(url, data=body, headers=headers, method=method)
+                          with urllib.request.urlopen(req, timeout=180) as response:
+                              data = response.read()
+                              return json.loads(data) if data else None
+                      except urllib.error.HTTPError as exc:
+                          if exc.code == 404 and missing_ok:
+                              return None
+                          if method != 'GET' or exc.code not in (429, 500, 502, 503, 504) or attempt == 3:
+                              raise RuntimeError(f'{method} {path.split("?")[0]}: HTTP {exc.code}') from None
+                      except (urllib.error.URLError, TimeoutError):
+                          if method != 'GET' or attempt == 3:
+                              raise RuntimeError(f'{method} {path.split("?")[0]}: connection failed; the next run can resume') from None
+                      time.sleep(2 ** (attempt + 1))
+          
+          
+          def fingerprint(asset):
+              return asset['name'], asset['size'], asset.get('digest')
+          
+          
+          def check_asset_names(assets):
+              names = [a['name'] for a in assets]
+              if len(names) != len(set(names)):
+                  raise RuntimeError('Upstream contains duplicate asset names')
+              for asset in assets:
+                  if Path(asset['name']).name != asset['name'] or asset['name'] in ('.', '..'):
+                      raise RuntimeError('Upstream contains an invalid asset name')
+                  digest = asset.get('digest') or ''
+                  if not digest.startswith('sha256:') or len(digest) != 71:
+                      raise RuntimeError('Upstream asset has no SHA-256 digest: ' + asset['name'])
+                  if not 0 <= asset['size'] <= 2 * 1024 ** 3:
+                      raise RuntimeError('Upstream asset size is outside GitHub release limits')
+          
+          
+          def missing_assets(upstream, destination):
+              expected = {a['name']: a for a in upstream}
+              for asset in destination:
+                  if asset['name'] not in expected:
+                      raise RuntimeError('Destination has an extra asset; leaving it unchanged: ' + asset['name'])
+                  if asset.get('state') != 'uploaded' or fingerprint(asset) != fingerprint(expected[asset['name']]):
+                      raise RuntimeError('Destination asset conflicts with upstream; leaving it unchanged: ' + asset['name'])
+              present = {a['name'] for a in destination}
+              return [a for a in upstream if a['name'] not in present]
+          
+          
+          def download(asset, folder):
+              url = urllib.parse.urlparse(asset['browser_download_url'])
+              if url.scheme != 'https' or url.hostname != 'github.com':
+                  raise RuntimeError('Unexpected upstream download host')
+              path = folder / asset['name']
+              for attempt in range(4):
+                  try:
+                      digest, size = hashlib.sha256(), 0
+                      # Public downloads deliberately receive no authentication headers.
+                      with urllib.request.urlopen(asset['browser_download_url'], timeout=180) as source, path.open('wb') as dest:
+                          while chunk := source.read(1024 * 1024):
+                              size += len(chunk)
+                              if size > asset['size']:
+                                  raise RuntimeError('Download exceeds its declared size')
+                              digest.update(chunk)
+                              dest.write(chunk)
+                      if size != asset['size'] or 'sha256:' + digest.hexdigest() != asset['digest']:
+                          raise RuntimeError('Upstream download failed SHA-256 verification: ' + asset['name'])
+                      return path
+                  except (urllib.error.URLError, TimeoutError):
+                      if attempt == 3:
+                          raise RuntimeError('Upstream download failed: ' + asset['name']) from None
+                      time.sleep(2 ** (attempt + 1))
+          
+          
+          def mirror(app, reader, writer, dry_run):
+              if app not in APPS:
+                  raise RuntimeError('Repository is not in the approved ArtCraft fork list')
+              fork, parent = OWNER + '/' + app, UPSTREAM + '/' + app
+              info = reader.request('GET', 'repos/' + fork)
+              if not info.get('fork') or info.get('parent', {}).get('full_name', '').lower() != parent:
+                  raise RuntimeError('Destination is no longer the expected ArtCraft fork')
+              release = reader.request('GET', 'repos/' + parent + '/releases/latest', missing_ok=True)
+              if release is None:
+                  return f'{fork}: no stable upstream release yet'
+              if release['draft'] or release['prerelease']:
+                  raise RuntimeError('The upstream latest endpoint returned an unpublished or prerelease build')
+              assets, tag = release['assets'], release['tag_name']
+              if not assets:
+                  raise RuntimeError('The upstream release has no downloads yet; retry next run')
+              check_asset_names(assets)
+              encoded_tag = urllib.parse.quote(tag, safe='')
+              ref_path = '/git/ref/tags/' + encoded_tag
+              upstream_tag = reader.request('GET', 'repos/' + parent + ref_path)
+              fork_tag = reader.request('GET', 'repos/' + fork + ref_path, missing_ok=True)
+              if fork_tag and (fork_tag['object']['sha'], fork_tag['object']['type']) != (upstream_tag['object']['sha'], upstream_tag['object']['type']):
+                  raise RuntimeError('Existing fork tag points somewhere else; it will not be moved')
+              access = reader if dry_run else writer
+              destination = access.request('GET', 'repos/' + fork + '/releases/tags/' + encoded_tag, missing_ok=True)
+              if destination is None:
+                  drafts = access.request('GET', 'repos/' + fork + '/releases?per_page=100')
+                  destination = next((r for r in drafts if r['tag_name'] == tag), None)
+              marker = 'Mirrored from the upstream ArtCraft release: ' + release['html_url']
+              notes = marker + '\n\nBinaries are copied unchanged from ArtCraft. Checksums and signatures are the upstream originals.\n\n---\n\n' + (release.get('body') or '')
+              if destination and not (destination.get('body') or '').startswith(marker):
+                  raise RuntimeError('Existing release is not an ArtCraft mirror; leaving it unchanged')
+              if destination and destination['draft'] and not dry_run:
+                  # GitHub can leave a failed upload in the starter state. Remove only those
+                  # unfinished files in this managed draft so the next attempt can resume.
+                  for asset in list(destination['assets']):
+                      if asset.get('state') != 'uploaded':
+                          writer.request('DELETE', f"repos/{fork}/releases/assets/{asset['id']}")
+                          destination['assets'].remove(asset)
+              pending = missing_assets(assets, destination['assets'] if destination else [])
+              if dry_run:
+                  return f'{fork}: {tag}, {len(assets)} assets verified; {len(pending)} would be copied'
+              if not fork_tag:
+                  # Forks share Git objects with upstream. Preserve the original tag object, including annotated tags.
+                  writer.request('POST', 'repos/' + fork + '/git/refs', {'ref': 'refs/tags/' + tag, 'sha': upstream_tag['object']['sha']})
+              if destination is None:
+                  destination = writer.request('POST', 'repos/' + fork + '/releases', {'tag_name': tag, 'name': release['name'] or tag, 'body': notes, 'draft': True, 'prerelease': False})
+              with tempfile.TemporaryDirectory(prefix='artcraft-release-') as temporary:
+                  for asset in pending:
+                      path = download(asset, Path(temporary))
+                      upload_path = f"repos/{fork}/releases/{destination['id']}/assets?" + urllib.parse.urlencode({'name': asset['name'], 'label': asset.get('label') or ''})
+                      uploaded = writer.request('POST', upload_path, path.read_bytes(), upload=True, content_type=asset.get('content_type') or 'application/octet-stream')
+                      if fingerprint(uploaded) != fingerprint(asset):
+                          raise RuntimeError('Uploaded asset failed verification: ' + asset['name'])
+                      path.unlink()
+              refreshed = writer.request('GET', f"repos/{fork}/releases/{destination['id']}")
+              if missing_assets(assets, refreshed['assets']):
+                  raise RuntimeError('Some release assets are still missing; leaving the release in its current state')
+              current = reader.request('GET', 'repos/' + parent + '/releases/latest')
+              if current['id'] != release['id'] or {fingerprint(a) for a in current['assets']} != {fingerprint(a) for a in assets}:
+                  raise RuntimeError('Upstream changed during the transfer; the next run will reconcile it')
+              metadata = {'name': release['name'] or tag, 'body': notes, 'draft': False, 'prerelease': False, 'make_latest': 'true'}
+              latest = reader.request('GET', 'repos/' + fork + '/releases/latest', missing_ok=True)
+              if refreshed['draft'] or refreshed['name'] != metadata['name'] or (refreshed.get('body') or '').strip() != notes.strip() or latest is None or latest['tag_name'] != tag:
+                  writer.request('PATCH', f"repos/{fork}/releases/{destination['id']}", metadata)
+              return f'{fork}: {tag} current; all {len(assets)} assets match upstream'
+          
+          
+          def main():
+              dry_run = os.environ.get('DRY_RUN', 'false') == 'true'
+              token = os.environ.get('ARTCRAFT_MIRROR_TOKEN', '')
+              if not dry_run and not token:
+                  raise RuntimeError('Add the ARTCRAFT_MIRROR_TOKEN Actions secret to enable release copying')
+              reader = GitHub(os.environ.get('GH_READ_TOKEN', ''), read_only=True)
+              writer = GitHub(token)
+              message = mirror(os.environ['APP'], reader, writer, dry_run)
+              print(message)
+              if os.environ.get('GITHUB_STEP_SUMMARY'):
+                  with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                      summary.write(message.replace('\n', ' ') + '\n')
+          
+          
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception as exc:
+                  print(f'Release sync failed: {exc}', file=sys.stderr)
+                  sys.exit(1)
+
+  keep-schedule-active:
+    needs: mirror
+    if: ${{ always() && !cancelled() && github.repository == 'allsagetech/artcraft-release-sync' && (github.event_name != 'workflow_dispatch' || !inputs.dry_run) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Record activity at most once every 28 days
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          """Keep this public controller's hourly schedule active with a monthly status commit."""
+          import base64
+          import datetime
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+          
+          repo = os.environ['GITHUB_REPOSITORY']
+          if repo != 'allsagetech/artcraft-release-sync':
+              raise RuntimeError('Unexpected controller repository')
+          url = f'https://api.github.com/repos/{repo}/contents/.github/release-sync-status.json'
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2026-03-10', 'User-Agent': 'artcraft-release-sync'}
+          now = datetime.datetime.now(datetime.timezone.utc)
+          existing = None
+          try:
+              with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as response:
+                  existing = json.load(response)
+          except urllib.error.HTTPError as exc:
+              if exc.code != 404:
+                  raise
+          if existing:
+              status = json.loads(base64.b64decode(existing['content']))
+              previous = datetime.datetime.fromisoformat(status['schedule_activity_at'])
+              if (now - previous).days < 28:
+                  print('Schedule activity is current')
+                  raise SystemExit(0)
+          content = json.dumps({'schedule_activity_at': now.isoformat(), 'purpose': 'Keep the hourly release mirror schedule active'}, indent=2) + '\n'
+          payload = {'message': 'Maintain the hourly ArtCraft release checks', 'content': base64.b64encode(content.encode()).decode()}
+          if existing:
+              payload['sha'] = existing['sha']
+          headers['Content-Type'] = 'application/json'
+          request = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers, method='PUT')
+          with urllib.request.urlopen(request, timeout=60) as response:
+              print('Recorded monthly schedule activity: HTTP', response.status)
